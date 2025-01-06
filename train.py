@@ -135,6 +135,9 @@ def run() -> Tuple[torch.nn.Module, str]:
     patience = 10
     patience_counter = 0
 
+    # Create models directory if it doesn't exist
+    os.makedirs('models', exist_ok=True)
+
 ## 3. Initialize the SEED
     
     SEED = 1
@@ -174,7 +177,7 @@ def run() -> Tuple[torch.nn.Module, str]:
     train = ImageNetKaggle("/home/shivamkhaneja1/data/imagenet/", "train", transform=train_transforms)
     test = ImageNetKaggle("/home/shivamkhaneja1/data/imagenet/", "val", transform=test_transforms)
 
-    dataloader_args = dict(shuffle=True, batch_size=96, num_workers=4, pin_memory=True) if cuda else dict(shuffle=True, batch_size=64)
+    dataloader_args = dict(shuffle=True, batch_size=256, num_workers=12, pin_memory=True) if cuda else dict(shuffle=True, batch_size=64)
     
     train_loader = torch.utils.data.DataLoader(train, **dataloader_args)
     test_loader = torch.utils.data.DataLoader(test, **dataloader_args)
