@@ -111,24 +111,39 @@ def train_model(model, device, train_loader, criterion, optimizer, epoch):
 def test_model(model, device, test_loader, criterion):
     model.eval()
     test_loss = 0
-    correct = 0
+    correct_top1 = 0
+    correct_top5 = 0
+    total = 0
     
     with torch.no_grad():
         for data, target in test_loader:
             data, target = data.to(device), target.to(device)
             output = model(data)
             test_loss += criterion(output, target).item()
-            pred = output.argmax(dim=1, keepdim=True)
-            correct += pred.eq(target.view_as(pred)).sum().item()
+            
+            # Top-1 accuracy
+            _, pred = output.topk(1, 1, True, True)
+            correct_top1 += pred.eq(target.view(-1, 1)).sum().item()
+            
+            # Top-5 accuracy
+            _, pred = output.topk(5, 1, True, True)
+            target_reshaped = target.view(-1, 1).expand_as(pred)
+            correct_top5 += pred.eq(target_reshaped).sum().item()
+            
+            total += target.size(0)
 
     test_loss /= len(test_loader)
-    accuracy = 100. * correct / len(test_loader.dataset)
+    top1_accuracy = 100. * correct_top1 / total
+    top5_accuracy = 100. * correct_top5 / total
 
-    print(f'\nTest set: Average loss: {test_loss:.4f}, Accuracy: {correct}/{len(test_loader.dataset)} ({accuracy:.2f}%)\n')
-    return test_loss, accuracy
+    print(f'\nTest set: Average loss: {test_loss:.4f}')
+    print(f'Top-1 Accuracy: {correct_top1}/{total} ({top1_accuracy:.2f}%)')
+    print(f'Top-5 Accuracy: {correct_top5}/{total} ({top5_accuracy:.2f}%)\n')
+    
+    return test_loss, top1_accuracy, top5_accuracy
 
 def save_checkpoint(epoch, model, optimizer, scheduler, train_losses, test_losses, 
-                   train_acc, test_acc, best_acc, filename):
+                   train_acc, test_top1_acc, test_top5_acc, best_acc, filename):
     checkpoint = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -137,7 +152,8 @@ def save_checkpoint(epoch, model, optimizer, scheduler, train_losses, test_losse
         'train_losses': train_losses,
         'test_losses': test_losses,
         'train_acc': train_acc,
-        'test_acc': test_acc,
+        'test_top1_acc': test_top1_acc,
+        'test_top5_acc': test_top5_acc,
         'best_acc': best_acc,
     }
     torch.save(checkpoint, filename)
@@ -148,7 +164,8 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_path):
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
     return (checkpoint['epoch'], checkpoint['train_losses'], checkpoint['test_losses'],
-            checkpoint['train_acc'], checkpoint['test_acc'], checkpoint['best_acc'])
+            checkpoint['train_acc'], checkpoint['test_top1_acc'], 
+            checkpoint['test_top5_acc'], checkpoint['best_acc'])
 
 def run() -> Tuple[torch.nn.Module, str]:
     # Create necessary directories
@@ -160,7 +177,8 @@ def run() -> Tuple[torch.nn.Module, str]:
     train_losses = []
     test_losses = []
     train_acc = []
-    test_acc = []
+    test_top1_acc = []
+    test_top5_acc = []
     best_acc = 0.0
     patience = 10
     patience_counter = 0
@@ -216,8 +234,6 @@ def run() -> Tuple[torch.nn.Module, str]:
     device = torch.device("cuda" if use_cuda else "cpu")
     model = ResNet50(len(train.syn_to_class)).to(device)
     pred = model(torch.rand(1,3,256,256).to(device))
-    print(pred.shape)
-    return
     # print(model)
     # summary(model, input_size=(3, 256, 256))
 
@@ -231,7 +247,7 @@ def run() -> Tuple[torch.nn.Module, str]:
     checkpoint_path = Path('checkpoints/latest_checkpoint.pth')
     if checkpoint_path.exists():
         print(f"Loading checkpoint from {checkpoint_path}")
-        start_epoch, train_losses, test_losses, train_acc, test_acc, best_acc = load_checkpoint(
+        start_epoch, train_losses, test_losses, train_acc, test_top1_acc, test_top5_acc, best_acc = load_checkpoint(
             model, optimizer, scheduler, checkpoint_path
         )
         print(f"Resuming from epoch {start_epoch+1}")
@@ -240,16 +256,21 @@ def run() -> Tuple[torch.nn.Module, str]:
     start_time = time.time()
     
     for epoch in range(start_epoch, EPOCHS):
+        epoch_start_time = time.time()
         print(f"\nEPOCH: {epoch+1}/{EPOCHS}")
         
         train_loss, train_accuracy = train_model(model, device, train_loader, criterion, optimizer, epoch)
-        test_loss, test_accuracy = test_model(model, device, test_loader, criterion)
+        test_loss, test_top1_accuracy, test_top5_accuracy = test_model(model, device, test_loader, criterion)
+        
+        epoch_time = time.time() - epoch_start_time
+        print(f'Epoch time elapsed: {epoch_time/60:.2f} minutes')
         
         # Record metrics
         train_losses.append(train_loss)
         test_losses.append(test_loss)
         train_acc.append(train_accuracy)
-        test_acc.append(test_accuracy)
+        test_top1_acc.append(test_top1_accuracy)
+        test_top5_acc.append(test_top5_accuracy)
         
         # Step the scheduler
         scheduler.step(test_loss)
@@ -257,64 +278,69 @@ def run() -> Tuple[torch.nn.Module, str]:
         # Save regular checkpoint
         save_checkpoint(
             epoch, model, optimizer, scheduler,
-            train_losses, test_losses, train_acc, test_acc,
-            best_acc, 'checkpoints/latest_checkpoint.pth'
+            train_losses, test_losses, train_acc, 
+            test_top1_acc, test_top5_acc, best_acc, 
+            'checkpoints/latest_checkpoint.pth'
         )
         
-        # Save best model
-        if test_accuracy > best_acc:
-            best_acc = test_accuracy
+        # Save best model (using top-1 accuracy as criterion)
+        if test_top1_accuracy > best_acc:
+            best_acc = test_top1_accuracy
             patience_counter = 0
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            best_model_path = f'models/best_model_{timestamp}_acc{test_accuracy:.2f}.pth'
+            best_model_path = f'models/best_model_{timestamp}_top1acc{test_top1_accuracy:.2f}.pth'
             save_checkpoint(
                 epoch, model, optimizer, scheduler,
-                train_losses, test_losses, train_acc, test_acc,
-                best_acc, best_model_path
+                train_losses, test_losses, train_acc,
+                test_top1_acc, test_top5_acc, best_acc,
+                best_model_path
             )
-            print(f'Saved best model with accuracy: {test_accuracy:.2f}%')
+            print(f'Saved best model with Top-1 accuracy: {test_top1_accuracy:.2f}%')
         else:
             patience_counter += 1
             if patience_counter >= patience:
                 print(f"Early stopping triggered after {epoch+1} epochs")
                 break
 
-    training_time = time.time() - start_time
-    print(f'\nTraining completed in {training_time/60:.2f} minutes')
+    total_time = time.time() - start_time
+    print(f'\nTotal training completed in {total_time/60:.2f} minutes')
 
-    # Save training history
+    # Save training history with top-5 accuracy
     history = {
         'train_losses': train_losses,
         'test_losses': test_losses,
         'train_acc': train_acc,
-        'test_acc': test_acc,
-        'training_time': training_time
+        'test_top1_acc': test_top1_acc,
+        'test_top5_acc': test_top5_acc,
+        'training_time': total_time
     }
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     with open(f'logs/training_history_{timestamp}.json', 'w') as f:
         json.dump(history, f)
 
-    # Plot training history
-    plt.figure(figsize=(15, 5))
-    plt.subplot(1, 3, 1)
+    # Update plotting to include top-5 accuracy
+    plt.figure(figsize=(20, 5))
+    plt.subplot(1, 4, 1)
     plt.plot(train_losses, label='Train Loss')
     plt.plot(test_losses, label='Test Loss')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.legend()
     
-    plt.subplot(1, 3, 2)
+    plt.subplot(1, 4, 2)
     plt.plot(train_acc, label='Train Accuracy')
-    plt.plot(test_acc, label='Test Accuracy')
+    plt.plot(test_top1_acc, label='Test Top-1 Accuracy')
     plt.xlabel('Epoch')
     plt.ylabel('Accuracy (%)')
     plt.legend()
     
-    # Add learning rate plot
-    lrs = []
-    for param_group in optimizer.param_groups:
-        lrs.append(param_group['lr'])
-    plt.subplot(1, 3, 3)
+    plt.subplot(1, 4, 3)
+    plt.plot(test_top5_acc, label='Test Top-5 Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy (%)')
+    plt.legend()
+    
+    plt.subplot(1, 4, 4)
     plt.plot(lrs)
     plt.xlabel('Epoch')
     plt.ylabel('Learning Rate')
