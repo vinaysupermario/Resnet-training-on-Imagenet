@@ -15,6 +15,7 @@ from datetime import datetime
 import logging
 from typing import Tuple
 from pathlib import Path
+import random
 
 # Import PyTorch libraries
 import torch
@@ -75,9 +76,61 @@ class ImageNetKaggle(Dataset):
         return len(self.samples)
     def __getitem__(self, idx):
         x = Image.open(self.samples[idx]).convert("RGB")
+        target = self.targets[idx]
+        
         if self.transform:
             x = self.transform(x)
-        return x, self.targets[idx]
+        
+        return x, target
+
+def get_mosaic_coordinates(image_size, mosaic_size):
+    """Get the coordinates to create a mosaic image"""
+    mosaic_border = [mosaic_size // 2 - image_size // 2, mosaic_size // 2 + image_size // 2]
+    xc = int(random.uniform(mosaic_border[0], mosaic_border[1]))
+    yc = int(random.uniform(mosaic_border[0], mosaic_border[1]))
+
+    return [
+        [xc - image_size, yc - image_size, xc, yc],  # top-left
+        [xc, yc - image_size, xc + image_size, yc],  # top-right
+        [xc - image_size, yc, xc, yc + image_size],  # bottom-left
+        [xc, yc, xc + image_size, yc + image_size],  # bottom-right
+    ]
+
+class MosaicTransform:
+    def __init__(self, base_transforms, image_size=224, mosaic_size=448, p=0.5):
+        self.base_transforms = base_transforms
+        self.image_size = image_size
+        self.mosaic_size = mosaic_size
+        self.p = p
+        self.train_dataset = None  # Will be set later
+
+    def set_dataset(self, dataset):
+        self.train_dataset = dataset
+
+    def __call__(self, img):
+        if self.train_dataset is None:
+            raise ValueError("Dataset not set for MosaicTransform")
+            
+        if random.random() > self.p:  # Apply regular transforms
+            return self.base_transforms(img)
+
+        # Create mosaic
+        mosaic_img = Image.new('RGB', (self.mosaic_size, self.mosaic_size))
+        coordinates = get_mosaic_coordinates(self.image_size, self.mosaic_size)
+        
+        # Get 3 more random images from the dataset
+        dataset_size = len(self.train_dataset)
+        indices = random.sample(range(dataset_size), 3)
+        images = [img] + [Image.open(self.train_dataset.samples[i]).convert('RGB') for i in indices]
+        
+        for img_idx, (coord, current_img) in enumerate(zip(coordinates, images)):
+            # Resize the image
+            current_img = current_img.resize((self.image_size, self.image_size))
+            # Paste into mosaic
+            mosaic_img.paste(current_img, (coord[0], coord[1]))
+
+        # Apply base transforms to mosaic
+        return self.base_transforms(mosaic_img)
 
 ## 9. Training and Testing Functions for model
 
@@ -204,26 +257,44 @@ def run() -> Tuple[torch.nn.Module, str]:
     mean = (0.485, 0.456, 0.406)
     std = (0.229, 0.224, 0.225)
     
-    # Train Phase transformations
-    train_transforms = transforms.Compose([
-                    transforms.Resize(256),
-                    transforms.CenterCrop(224),
-                    transforms.ToTensor(),
-                    transforms.Normalize(mean,std)])
+    # Base transforms
+    base_transforms = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std)
+    ])
     
-    # Validation Phase transformations
-    test_transforms = transforms.Compose([
-                    transforms.Resize(256),
-                    transforms.CenterCrop(224),
-                    transforms.ToTensor(),
-                    transforms.Normalize(mean,std)])
+    # Create MosaicTransform instance
+    mosaic_transform = MosaicTransform(base_transforms, image_size=224, mosaic_size=448, p=0.5)
+    
+    # Training transforms with mosaic
+    train_transforms = transforms.Compose([
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(15),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+        transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
+        mosaic_transform,
+        transforms.RandomErasing(p=0.3)
+    ])
+    
+    # Test transforms remain the same
+    test_transforms = base_transforms
 
 ## 6. Import the Data using Dataset, and Define the DataLoader to create batches
 
     train = ImageNetKaggle("/home/shivamkhaneja1/data/imagenet/", "train", transform=train_transforms)
     test = ImageNetKaggle("/home/shivamkhaneja1/data/imagenet/", "val", transform=test_transforms)
 
-    dataloader_args = dict(shuffle=True, batch_size=96, num_workers=4, pin_memory=True) if cuda else dict(shuffle=True, batch_size=64)
+    # Set the dataset for mosaic transform
+    mosaic_transform.set_dataset(train)
+
+    dataloader_args = dict(
+        shuffle=True, 
+        batch_size=64 if cuda else 32,  # Reduced batch size due to mosaic
+        num_workers=4, 
+        pin_memory=True
+    ) if cuda else dict(shuffle=True, batch_size=32)
     
     train_loader = torch.utils.data.DataLoader(train, **dataloader_args)
     test_loader = torch.utils.data.DataLoader(test, **dataloader_args)
