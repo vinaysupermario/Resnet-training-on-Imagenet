@@ -82,28 +82,48 @@ class ImageNetKaggle(Dataset):
 
 def train_model(model, device, train_loader, criterion, optimizer, epoch):
     model.train()
-    pbar = tqdm(train_loader)
     correct = 0
     processed = 0
     running_loss = 0.0
     
+    # Initialize gradient scaler for mixed precision training
+    scaler = GradScaler()
+    
+    # Use a larger update interval for progress bar to reduce overhead
+    pbar = tqdm(train_loader, miniters=100)
+    
+    # Pre-fetch next batch using pin_memory
     for batch_idx, (data, target) in enumerate(pbar):
-        data, target = data.to(device), target.to(device)
+        # Move data to GPU asynchronously
+        data = data.to(device, non_blocking=True)
+        target = target.to(device, non_blocking=True)
 
-        optimizer.zero_grad()
-        y_pred = model(data)
-
-        loss = criterion(y_pred, target)  # Using the defined criterion
+        # Zero gradients
+        optimizer.zero_grad(set_to_none=True)  # Slightly faster than zero_grad()
         
-        loss.backward()
-        optimizer.step()
+        # Use automatic mixed precision training
+        with autocast():
+            y_pred = model(data)
+            loss = criterion(y_pred, target)
+
+        # Scale loss and compute gradients
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         running_loss += loss.item()
-        pred = y_pred.argmax(dim=1, keepdim=True)
-        correct += pred.eq(target.view_as(pred)).sum().item()
-        processed += len(data)
+        
+        # Compute accuracy metrics without blocking
+        with torch.no_grad():
+            pred = y_pred.argmax(dim=1, keepdim=True)
+            correct += pred.eq(target.view_as(pred)).sum().item()
+            processed += len(data)
 
-        pbar.set_description(desc= f'Loss={loss.item():.4f} Batch_id={batch_idx} Accuracy={100*correct/processed:0.2f}')
+        # Update progress bar less frequently
+        if batch_idx % 100 == 0:
+            pbar.set_description(
+                f'Loss={loss.item():.4f} Batch_id={batch_idx} Accuracy={100*correct/processed:0.2f}'
+            )
     
     return running_loss / len(train_loader), 100. * correct / processed
 
@@ -177,7 +197,14 @@ def run() -> Tuple[torch.nn.Module, str]:
     train = ImageNetKaggle("/home/shivamkhaneja1/data/imagenet/", "train", transform=train_transforms)
     test = ImageNetKaggle("/home/shivamkhaneja1/data/imagenet/", "val", transform=test_transforms)
 
-    dataloader_args = dict(shuffle=True, batch_size=256, num_workers=12, pin_memory=True) if cuda else dict(shuffle=True, batch_size=64)
+    dataloader_args = dict(
+        shuffle=True,
+        batch_size=256,
+        num_workers=4 * torch.cuda.device_count(),  # Scale workers with GPUs
+        pin_memory=True,
+        prefetch_factor=2,  # Prefetch 2 batches per worker
+        persistent_workers=True  # Keep workers alive between epochs
+    ) if cuda else dict(shuffle=True, batch_size=64)
     
     train_loader = torch.utils.data.DataLoader(train, **dataloader_args)
     test_loader = torch.utils.data.DataLoader(test, **dataloader_args)
@@ -187,13 +214,14 @@ def run() -> Tuple[torch.nn.Module, str]:
     use_cuda = torch.cuda.is_available()
     device = torch.device("cuda" if use_cuda else "cpu")
     model = ResNet50(len(train.syn_to_class)).to(device)
+    model = torch.nn.DataParallel(model)  # Simple multi-GPU
     # print(model)
     # summary(model, input_size=(3, 256, 256))
 
 ## 8. Train and Test the Model
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=0.0001)
+    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.0001)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor = 0.1, patience=5)
 
     for epoch in range(EPOCHS):
