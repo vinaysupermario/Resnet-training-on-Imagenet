@@ -14,6 +14,7 @@ from tqdm import tqdm
 from datetime import datetime
 import logging
 from typing import Tuple
+from pathlib import Path
 
 # Import PyTorch libraries
 import torch
@@ -126,7 +127,36 @@ def test_model(model, device, test_loader, criterion):
     print(f'\nTest set: Average loss: {test_loss:.4f}, Accuracy: {correct}/{len(test_loader.dataset)} ({accuracy:.2f}%)\n')
     return test_loss, accuracy
 
+def save_checkpoint(epoch, model, optimizer, scheduler, train_losses, test_losses, 
+                   train_acc, test_acc, best_acc, filename):
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'train_losses': train_losses,
+        'test_losses': test_losses,
+        'train_acc': train_acc,
+        'test_acc': test_acc,
+        'best_acc': best_acc,
+    }
+    torch.save(checkpoint, filename)
+
+def load_checkpoint(model, optimizer, scheduler, checkpoint_path):
+    checkpoint = torch.load(checkpoint_path)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    return (checkpoint['epoch'], checkpoint['train_losses'], checkpoint['test_losses'],
+            checkpoint['train_acc'], checkpoint['test_acc'], checkpoint['best_acc'])
+
 def run() -> Tuple[torch.nn.Module, str]:
+    # Create necessary directories
+    Path('models').mkdir(exist_ok=True)
+    Path('checkpoints').mkdir(exist_ok=True)
+    Path('logs').mkdir(exist_ok=True)
+
+    # Initialize metrics storage
     train_losses = []
     test_losses = []
     train_acc = []
@@ -134,8 +164,9 @@ def run() -> Tuple[torch.nn.Module, str]:
     best_acc = 0.0
     patience = 10
     patience_counter = 0
+    start_epoch = 0
 
-## 3. Initialize the SEED
+    ## 3. Initialize the SEED
     
     SEED = 1
     cuda = torch.cuda.is_available()
@@ -184,6 +215,9 @@ def run() -> Tuple[torch.nn.Module, str]:
     use_cuda = torch.cuda.is_available()
     device = torch.device("cuda" if use_cuda else "cpu")
     model = ResNet50(len(train.syn_to_class)).to(device)
+    pred = model(torch.rand(1,3,256,256).to(device))
+    print(pred.shape)
+    return
     # print(model)
     # summary(model, input_size=(3, 256, 256))
 
@@ -191,10 +225,22 @@ def run() -> Tuple[torch.nn.Module, str]:
 
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=0.0001)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor = 0.1, patience=5)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
 
-    for epoch in range(EPOCHS):
-        print(f"EPOCH: {epoch+1}/{EPOCHS}")
+    # Load checkpoint if exists
+    checkpoint_path = Path('checkpoints/latest_checkpoint.pth')
+    if checkpoint_path.exists():
+        print(f"Loading checkpoint from {checkpoint_path}")
+        start_epoch, train_losses, test_losses, train_acc, test_acc, best_acc = load_checkpoint(
+            model, optimizer, scheduler, checkpoint_path
+        )
+        print(f"Resuming from epoch {start_epoch+1}")
+
+    # Training loop
+    start_time = time.time()
+    
+    for epoch in range(start_epoch, EPOCHS):
+        print(f"\nEPOCH: {epoch+1}/{EPOCHS}")
         
         train_loss, train_accuracy = train_model(model, device, train_loader, criterion, optimizer, epoch)
         test_loss, test_accuracy = test_model(model, device, test_loader, criterion)
@@ -208,40 +254,76 @@ def run() -> Tuple[torch.nn.Module, str]:
         # Step the scheduler
         scheduler.step(test_loss)
         
-        # Early stopping
+        # Save regular checkpoint
+        save_checkpoint(
+            epoch, model, optimizer, scheduler,
+            train_losses, test_losses, train_acc, test_acc,
+            best_acc, 'checkpoints/latest_checkpoint.pth'
+        )
+        
+        # Save best model
         if test_accuracy > best_acc:
             best_acc = test_accuracy
             patience_counter = 0
-            # Save best model
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            save_path = f'models/model_{timestamp}_acc{test_accuracy:.2f}.pth'
-            torch.save(model.cpu().state_dict(), save_path)
-            model.to(device)
+            best_model_path = f'models/best_model_{timestamp}_acc{test_accuracy:.2f}.pth'
+            save_checkpoint(
+                epoch, model, optimizer, scheduler,
+                train_losses, test_losses, train_acc, test_acc,
+                best_acc, best_model_path
+            )
+            print(f'Saved best model with accuracy: {test_accuracy:.2f}%')
         else:
             patience_counter += 1
             if patience_counter >= patience:
                 print(f"Early stopping triggered after {epoch+1} epochs")
                 break
 
+    training_time = time.time() - start_time
+    print(f'\nTraining completed in {training_time/60:.2f} minutes')
+
+    # Save training history
+    history = {
+        'train_losses': train_losses,
+        'test_losses': test_losses,
+        'train_acc': train_acc,
+        'test_acc': test_acc,
+        'training_time': training_time
+    }
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    with open(f'logs/training_history_{timestamp}.json', 'w') as f:
+        json.dump(history, f)
+
     # Plot training history
-    plt.figure(figsize=(12, 4))
-    plt.subplot(1, 2, 1)
+    plt.figure(figsize=(15, 5))
+    plt.subplot(1, 3, 1)
     plt.plot(train_losses, label='Train Loss')
     plt.plot(test_losses, label='Test Loss')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.legend()
     
-    plt.subplot(1, 2, 2)
+    plt.subplot(1, 3, 2)
     plt.plot(train_acc, label='Train Accuracy')
     plt.plot(test_acc, label='Test Accuracy')
     plt.xlabel('Epoch')
     plt.ylabel('Accuracy (%)')
     plt.legend()
-    plt.tight_layout()
-    plt.savefig(f'training_history_{timestamp}.png')
     
-    return model, save_path
+    # Add learning rate plot
+    lrs = []
+    for param_group in optimizer.param_groups:
+        lrs.append(param_group['lr'])
+    plt.subplot(1, 3, 3)
+    plt.plot(lrs)
+    plt.xlabel('Epoch')
+    plt.ylabel('Learning Rate')
+    plt.title('Learning Rate Schedule')
+    
+    plt.tight_layout()
+    plt.savefig(f'logs/training_history_{timestamp}.png')
+    
+    return model, best_model_path
 
 EPOCHS = 1
 if __name__ == "__main__":
